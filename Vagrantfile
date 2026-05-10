@@ -135,7 +135,7 @@ fi
   "mcpServers": {
     "project-filesystem": {
       "type": "sse",
-      "url": "http://192.168.56.1:9000/sse"
+      "url": "https://192.168.56.1:9000/sse"
     }
   }
 }
