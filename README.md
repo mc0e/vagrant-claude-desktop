@@ -6,7 +6,10 @@ The idea here is to run claude-desktop with an absolute minimum exposure of the 
 
 Vagrant appears in a window on the Vagrant Host via X forwarding over ssh.
 
-My MCP connector exposes only two operations - list files, and read file content, though other connectors are possible.
+My MCP connector exposes only two operations, though other connectors are possible.
+  - list_directory(path)  -- list files and subdirectories under a path
+  - read_file(path)       -- return the contents of a file
+
 
 ## Usage
 
