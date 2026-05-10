@@ -1,0 +1,60 @@
+#!/bin/bash
+# mcp-serve — start the read-only MCP filesystem server for this project.
+#
+# Locates the project root by walking up from this script's location
+# until a directory containing '.git' is found. Binds to the VirtualBox
+# host-only interface so only the Vagrant VM can reach it. Ctrl-C to stop.
+#
+# Usage: mcp-serve [-h|--help] [--host HOST] [--port PORT]
+#
+# Options:
+#   -h, --help       Show this help and exit
+#   --host HOST      Interface to bind (default: 192.168.56.1)
+#   --port PORT      Port to listen on (default: 9000)
+#
+# Requirements:
+#   On debian bookworm:
+#     sudo apt install python3-uvicorn python3-starlette
+#   Alternatively:
+#     pip install --user starlette uvicorn
+
+set -euo pipefail
+
+usage() {
+    sed -n '/^# Usage:/,/^# Requirements:/{ s/^# \{0,1\}//; p }' "$0"
+    exit 0
+}
+
+for arg in "$@"; do
+    case "$arg" in
+        -h|--help) usage ;;
+    esac
+done
+
+# Walk up from the script's directory to find the git root
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SERVER="$SCRIPT_DIR/mcp_readonly_fs.py"
+
+find_git_root() {
+    local dir="$1"
+    while [[ "$dir" != "/" ]]; do
+        [[ -d "$dir/.git" ]] && echo "$dir" && return
+        dir="$(dirname "$dir")"
+    done
+    echo "Error: no .git directory found above $SCRIPT_DIR" >&2
+    exit 1
+}
+
+if [[ ! -f "$SERVER" ]]; then
+    echo "Error: $SERVER not found" >&2
+    exit 1
+fi
+
+export REPO_ROOT="$(find_git_root "$SCRIPT_DIR")"
+
+echo "MCP server starting"
+echo "  Repo root : $REPO_ROOT"
+echo "  Press Ctrl-C to stop"
+echo ""
+
+exec python3 "$SERVER" --host 192.168.56.1 --port 9000 "$@"
