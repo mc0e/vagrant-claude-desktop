@@ -83,10 +83,11 @@ fi
 
     # Add the claude-desktop-debian apt repository
     curl -fsSL https://pkg.claude-desktop-debian.dev/KEY.gpg \
-      | gpg --dearmor -o /usr/share/keyrings/claude-desktop.gpg
+        | gpg --dearmor \
+        | tee /usr/share/keyrings/claude-desktop.gpg > /dev/null
 
     echo "deb [signed-by=/usr/share/keyrings/claude-desktop.gpg arch=amd64] \
-      http://pkg.claude-desktop-debian.dev stable main" \
+      https://pkg.claude-desktop-debian.dev stable main" \
       | tee /etc/apt/sources.list.d/claude-desktop.list
 
     apt-get update
@@ -130,19 +131,95 @@ fi
     # -----------------------------------------------------------------------
     CLAUDE_CFG_DIR="/home/vagrant/.config/Claude"
     mkdir -p "$CLAUDE_CFG_DIR"
-    cat > "$CLAUDE_CFG_DIR/claude_desktop_config.json" <<'EOF'
-{
-  "mcpServers": {
-    "project-filesystem": {
-      "type": "sse",
-      "url": "https://192.168.56.1:9000/sse"
-    }
-  }
-}
-EOF
     chown -R vagrant:vagrant "$CLAUDE_CFG_DIR"
 
-    echo "Provisioning complete. Rebooting into desktop..."
+
+# Update only the mcpServers section, preserving any other config
+    python3 - "$CLAUDE_CFG_DIR/claude_desktop_config.json" <<'EOF'
+import json, sys
+path = sys.argv[1]
+try:
+    cfg = json.load(open(path))
+except (FileNotFoundError, json.JSONDecodeError):
+    cfg = {}
+cfg["mcpServers"] = {
+    "project-filesystem": {
+        "type": "sse",
+        "url": "https://localhost:9000/sse"
+    }
+}
+json.dump(cfg, open(path, "w"), indent=2)
+print(f"Updated mcpServers in {path}")
+EOF
+    chown vagrant:vagrant "$CLAUDE_CFG_DIR/claude_desktop_config.json"
+
+
+    # Install caddy
+    apt-get install -y debian-keyring debian-archive-keyring apt-transport-https
+    curl -fsSL 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+        | gpg --dearmor \
+        | tee /usr/share/keyrings/caddy-stable-archive-keyring.gpg > /dev/null
+    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+        | tee /etc/apt/sources.list.d/caddy-stable.list
+    apt-get update && apt-get install -y caddy libnss3-tools
+
+    # Pre-create the NSS DB for vagrant user NOW, so caddy trust can find it
+    sudo -u vagrant bash -c '
+        mkdir -p ~/.pki/nssdb
+        certutil -d sql:$HOME/.pki/nssdb -N --empty-password 2>/dev/null || true
+    '
+
+    # Caddyfile: reverse proxy https→http for the host MCP server
+    cat > /etc/caddy/Caddyfile <<'EOF'
+{
+    local_certs
+    auto_https disable_redirects
+}
+
+localhost:9000 {
+    bind 127.0.0.1
+    reverse_proxy 192.168.56.1:9000 {
+        flush_interval -1
+        transport http {
+            response_header_timeout 0
+        }
+    }
+}
+EOF
+
+    systemctl enable caddy
+    systemctl start caddy
+
+    # Run caddy trust — this will install into system store AND nssdb if certutil found
+    caddy trust
+
+    systemctl restart caddy
+
+
+    # Patch the Electron launcher to also use --ignore-certificate-errors as a fallback
+    # (we can remove this line later once we confirm trust works)
+    sed -i \
+      's|"--no-sandbox" "--disable-seccomp-filter-sandbox"|"--no-sandbox" "--disable-seccomp-filter-sandbox" "--ignore-certificate-errors-spki-list=<SPKI>"|' \
+      /usr/bin/claude-desktop
+
+    cp /var/lib/caddy/.local/share/caddy/pki/authorities/local/root.crt /etc/caddy/local-ca.crt
+    chmod 644 /etc/caddy/local-ca.crt
+
+    cat > /usr/local/bin/claude-desktop-sandboxed <<'EOF'
+#!/bin/bash
+SPKI=$(openssl x509 -in /etc/caddy/local-ca.crt \
+    -pubkey -noout \
+    | openssl pkey -pubin -outform der \
+    | openssl dgst -sha256 -binary \
+    | base64)
+exec dbus-launch --exit-with-session claude-desktop \
+    --ignore-certificate-errors-spki-list="$SPKI" \
+    "$@"
+EOF
+    chmod +x /usr/local/bin/claude-desktop-sandboxed
+
+
+    echo "Provisioning complete.  Run vagrant ssh -- -X claude-desktop-sandboxed"
   SHELL
 
 end
