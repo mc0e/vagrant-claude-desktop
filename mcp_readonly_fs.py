@@ -6,21 +6,54 @@ Exposes two tools to MCP clients:
   - list_directory(path)  -- list files and subdirectories under a path
   - read_file(path)       -- return the contents of a file
 
-All paths are resolved relative to REPO_ROOT and must remain within it.
+All paths are resolved relative to the served root and must remain within it.
 No write operations are exposed.
 
-Dependencies (no Anthropic packages):
-  pip install starlette uvicorn
+Transports
+----------
+  POST /mcp          Streamable-HTTP (single-request/response)
+  GET  /sse          SSE stream — client connects here first; server sends
+                     an 'endpoint' event pointing to /messages
+  POST /messages     JSON-RPC messages from SSE clients; responses are
+                     delivered over the open SSE stream
+
+Root discovery (in priority order)
+-----------------------------------
+  1. Positional argument: mcp_readonly_fs.py /path/to/root
+  2. Walk up from cwd to find the nearest .git directory
+  3. Fall back to cwd if no .git found
+
+Configuration
+-------------
+  An optional .mcp-serve.json file at the served root can override defaults:
+    {
+      "host": "192.168.56.1",   // default: 192.168.56.1
+      "port": 9000              // default: 9000
+    }
+  CLI arguments always override .mcp-serve.json values.
+
+Dependencies:
+  Only starlette + uvicorn — both available as Debian bookworm packages,
+  no extra pip installs required:
+    sudo apt install python3-uvicorn python3-starlette   # Debian bookworm
+    pip install --user starlette uvicorn                 # or via pip
 
 Usage:
-  REPO_ROOT=/path/to/repo python mcp_readonly_fs.py [--host HOST] [--port PORT]
+  mcp_readonly_fs.py [root_path] [--host HOST] [--port PORT]
 
-  Defaults: host=127.0.0.1  port=9000
-  For use from a Vagrant VM, bind to the host-only interface, e.g.:
-    REPO_ROOT=/home/user/projects/MMMobile python mcp_readonly_fs.py --host 192.168.56.1
+  For use from a Vagrant VM, bind to the host-only interface:
+    mcp_readonly_fs.py --host 192.168.56.1
+  or set "host" in .mcp-serve.json at the repo root.
+
+Installation:
+  chmod +x mcp_readonly_fs.py
+  ln -s $(pwd)/mcp_readonly_fs.py ~/.local/bin/mcp-serve
+  # ensure ~/.local/bin is in $PATH (add to ~/.bashrc if not):
+  #   export PATH="$HOME/.local/bin:$PATH"
 """
 
 import argparse
+import asyncio
 import json
 import logging
 import os
@@ -30,21 +63,46 @@ from pathlib import Path
 import uvicorn
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-REPO_ROOT = Path(os.environ.get("REPO_ROOT", ".")).resolve()
-log.info("REPO_ROOT: %s", REPO_ROOT)
-
-SERVER_INFO = {"name": "mcp-readonly-fs", "version": "0.1.0"}
+SERVER_INFO = {"name": "mcp-readonly-fs", "version": "0.3.0"}
 PROTOCOL_VERSION = "2024-11-05"
+
+# Set in main() before the app starts
+SERVED_ROOT: Path
+
+# ---------------------------------------------------------------------------
+# Root discovery
+# ---------------------------------------------------------------------------
+
+def find_git_root(start: Path) -> Path | None:
+    """Walk up from start until a .git directory is found. Returns None if not found."""
+    current = start.resolve()
+    while True:
+        if (current / ".git").exists():
+            return current
+        parent = current.parent
+        if parent == current:
+            return None
+        current = parent
+
+
+def load_config(git_root: Path) -> dict:
+    """Load .mcp-serve.json from the git root if present; return {} otherwise."""
+    config_path = git_root / ".mcp-serve.json"
+    if not config_path.exists():
+        return {}
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        log.info("Loaded config from %s", config_path)
+        return config
+    except Exception as e:
+        log.warning("Could not read %s: %s", config_path, e)
+        return {}
 
 # ---------------------------------------------------------------------------
 # Path safety
@@ -52,13 +110,12 @@ PROTOCOL_VERSION = "2024-11-05"
 
 def safe_resolve(raw: str) -> Path:
     """
-    Resolve a client-supplied path to an absolute path inside REPO_ROOT.
+    Resolve a client-supplied path to an absolute path inside SERVED_ROOT.
     Raises ValueError if the path escapes the root.
     """
-    # Strip leading slash so Path(root) / "/etc/passwd" doesn't escape
     stripped = raw.lstrip("/")
-    resolved = (REPO_ROOT / stripped).resolve()
-    if not resolved.is_relative_to(REPO_ROOT):
+    resolved = (SERVED_ROOT / stripped).resolve()
+    if not resolved.is_relative_to(SERVED_ROOT):
         raise ValueError(f"Path {raw!r} is outside the allowed root")
     return resolved
 
@@ -80,7 +137,7 @@ def tool_list_directory(args: dict) -> dict:
 
     entries = []
     for entry in sorted(target.iterdir()):
-        rel = entry.relative_to(REPO_ROOT)
+        rel = entry.relative_to(SERVED_ROOT)
         kind = "dir" if entry.is_dir() else "file"
         size = "" if entry.is_dir() else f"  ({entry.stat().st_size} bytes)"
         entries.append(f"{kind}  {rel}{size}")
@@ -127,7 +184,7 @@ TOOLS = {
         "meta": {
             "name": "list_directory",
             "description": (
-                "List the contents of a directory within the project repository. "
+                "List the contents of a directory within the served root. "
                 "Pass an empty string or '.' for the root."
             ),
             "inputSchema": {
@@ -135,7 +192,7 @@ TOOLS = {
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative path within the repo (e.g. 'Design' or 'Design/decisions')",
+                        "description": "Relative path within the root (e.g. 'src' or 'src/lib')",
                     }
                 },
                 "required": [],
@@ -147,7 +204,7 @@ TOOLS = {
         "meta": {
             "name": "read_file",
             "description": (
-                "Read the contents of a file within the project repository. "
+                "Read the contents of a file within the served root. "
                 "Returns the raw text content."
             ),
             "inputSchema": {
@@ -155,7 +212,7 @@ TOOLS = {
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative path to the file within the repo (e.g. 'Design/model.json')",
+                        "description": "Relative path to the file within the root (e.g. 'README.md')",
                     }
                 },
                 "required": ["path"],
@@ -182,11 +239,10 @@ def dispatch(msg: dict) -> dict | None:
     Handle one JSON-RPC message. Returns a dict to send back, or None for
     notifications (which must not receive a response).
     """
-    id_ = msg.get("id")          # None for notifications
+    id_ = msg.get("id")
     method = msg.get("method", "")
     params = msg.get("params") or {}
 
-    # Notifications have no id and need no response
     if id_ is None:
         log.debug("Notification received: %s", method)
         return None
@@ -217,8 +273,7 @@ def dispatch(msg: dict) -> dict | None:
     return jsonrpc_error(id_, -32601, f"Method not found: {method!r}")
 
 # ---------------------------------------------------------------------------
-# Starlette HTTP endpoint
-# Implements Streamable HTTP transport (single /mcp endpoint, POST)
+# Streamable-HTTP transport  POST /mcp
 # ---------------------------------------------------------------------------
 
 async def mcp_endpoint(request: Request) -> Response:
@@ -233,15 +288,89 @@ async def mcp_endpoint(request: Request) -> Response:
     response = dispatch(msg)
 
     if response is None:
-        # Notification: no body response
         return Response(status_code=204)
 
     log.debug("<- %s", response)
     return JSONResponse(response)
 
+# ---------------------------------------------------------------------------
+# SSE transport  GET /sse  +  POST /messages
+#
+# Implemented with raw Starlette StreamingResponse — no sse-starlette needed.
+#
+# Protocol:
+#   1. Client opens GET /sse → receives event: endpoint pointing to /messages
+#   2. Client POSTs JSON-RPC to /messages?session_id=...
+#   3. Server pushes JSON-RPC response over the open SSE stream
+# ---------------------------------------------------------------------------
+
+_sse_queues: dict[str, asyncio.Queue] = {}
+
+
+def _sse_format(event: str, data: str) -> str:
+    return f"event: {event}\ndata: {data}\n\n"
+
+
+async def sse_endpoint(request: Request):
+    session_id = str(id(request))
+    queue: asyncio.Queue = asyncio.Queue()
+    _sse_queues[session_id] = queue
+    log.info("SSE client connected, session=%s", session_id)
+
+    async def event_stream():
+        yield _sse_format("endpoint", f"/messages?session_id={session_id}")
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    payload = await asyncio.wait_for(queue.get(), timeout=15)
+                    yield _sse_format("message", json.dumps(payload))
+                except asyncio.TimeoutError:
+                    yield ": keep-alive\n\n"
+        finally:
+            _sse_queues.pop(session_id, None)
+            log.info("SSE client disconnected, session=%s", session_id)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+async def messages_endpoint(request: Request) -> Response:
+    session_id = request.query_params.get("session_id")
+    queue = _sse_queues.get(session_id)
+    if queue is None:
+        return JSONResponse({"error": "Unknown or expired session_id"}, status_code=400)
+
+    try:
+        body = await request.body()
+        msg = json.loads(body)
+    except Exception:
+        await queue.put(jsonrpc_error(None, -32700, "Parse error"))
+        return Response(status_code=204)
+
+    log.debug("SSE -> %s", msg)
+    response = dispatch(msg)
+    if response is not None:
+        log.debug("SSE <- %s", response)
+        await queue.put(response)
+
+    return Response(status_code=204)
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
 
 app = Starlette(routes=[
-    Route("/mcp", mcp_endpoint, methods=["POST"]),
+    Route("/mcp",      mcp_endpoint,      methods=["POST"]),
+    Route("/sse",      sse_endpoint,      methods=["GET"]),
+    Route("/messages", messages_endpoint, methods=["POST"]),
 ])
 
 # ---------------------------------------------------------------------------
@@ -249,15 +378,50 @@ app = Starlette(routes=[
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Read-only MCP filesystem server")
-    parser.add_argument("--host", default="127.0.0.1",
-                        help="Interface to bind (default: 127.0.0.1)")
-    parser.add_argument("--port", type=int, default=9000,
-                        help="Port to listen on (default: 9000)")
-    args = parser.parse_args()
+    parser = argparse.ArgumentParser(
+        description="Read-only MCP filesystem server",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Root discovery: walks up from cwd to find the nearest .git directory;\n"
+            "falls back to cwd if no .git is found.\n"
+            "Config:         .mcp-serve.json at the served root can set host/port defaults.\n"
+            "CLI args always override .mcp-serve.json."
+        ),
+    )
+    parser.add_argument(
+        "root_path",
+        nargs="?",
+        default=None,
+        help="Directory to serve (default: nearest git root above cwd, or cwd)",
+    )
+    parser.add_argument("--host", default=None, help="Interface to bind")
+    parser.add_argument("--port", type=int, default=None, help="Port to listen on")
+    cli = parser.parse_args()
 
-    log.info("Starting MCP read-only filesystem server on %s:%d", args.host, args.port)
-    log.info("Serving repo: %s", REPO_ROOT)
-    log.info("Tools: %s", ", ".join(TOOLS))
+    # Resolve served root
+    if cli.root_path:
+        SERVED_ROOT = Path(cli.root_path).resolve()
+        if not SERVED_ROOT.is_dir():
+            log.error("Not a directory: %s", SERVED_ROOT)
+            sys.exit(1)
+    else:
+        cwd = Path.cwd()
+        git_root = find_git_root(cwd)
+        if git_root:
+            SERVED_ROOT = git_root
+        else:
+            log.warning("No .git directory found above %s; serving cwd", cwd)
+            SERVED_ROOT = cwd.resolve()
 
-    uvicorn.run(app, host=args.host, port=args.port)
+    config = load_config(SERVED_ROOT)
+
+    # Config < CLI args
+    host = cli.host or config.get("host", "192.168.56.1")
+    port = cli.port or config.get("port", 9000)
+
+    log.info("Serving:    %s", SERVED_ROOT)
+    log.info("Listening:  %s:%d", host, port)
+    log.info("Tools:      %s", ", ".join(TOOLS))
+    log.info("Transports: POST /mcp  |  GET /sse + POST /messages")
+
+    uvicorn.run(app, host=host, port=port)
