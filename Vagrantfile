@@ -64,11 +64,10 @@ if perl -MIO::Socket::INET -e 'exit 1 unless IO::Socket::INET->new(PeerAddr=>"19
 
   echo "Acquire::http::Proxy \\"${HTTP_PROXY}\\";"  >/etc/apt/apt.conf.d/01proxy
 
+  # make DNS work with Mullvad VPN on host.
   sed -i  '/^nameserver / d' /etc/resolv.conf
   echo "nameserver 10.64.0.1" >> /etc/resolv.conf
-
 fi
-
 
     # -----------------------------------------------------------------------
     # X11 forwarding support - no X server needed in the VM
@@ -82,6 +81,7 @@ fi
       libx11-xcb1
 
     # Add the claude-desktop-debian apt repository
+    #   based on https://github.com/aaddrick/claude-desktop-debian
     curl -fsSL https://pkg.claude-desktop-debian.dev/KEY.gpg \
         | gpg --dearmor \
         | tee /usr/share/keyrings/claude-desktop.gpg > /dev/null
