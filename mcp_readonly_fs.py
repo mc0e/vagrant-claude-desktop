@@ -41,6 +41,16 @@ Dependencies:
 Usage:
   mcp_readonly_fs.py [root_path] [--host HOST] [--port PORT]
 
+  To expose via HTTPS, pass --public-host and certificate paths.  Caddy will
+  be started as a reverse proxy and torn down when the server exits:
+    mcp_readonly_fs.py \
+        --public-host vhost.x.mc0e.net \
+        --public-port 9000 \
+        --cert /etc/letsencrypt/live/vhost.x.mc0e.net/fullchain.pem \
+        --key  /etc/letsencrypt/live/vhost.x.mc0e.net/privkey.pem
+  Caddy listens on 192.168.56.1:<public-port> (HTTPS) and forwards to
+  127.0.0.1:<port> (HTTP).  Requires caddy >= 2.0 in $PATH.
+
   For use from a Vagrant VM, bind to the host-only interface:
     mcp_readonly_fs.py --host 192.168.56.1
   or set "host" in .mcp-serve.json at the repo root.
@@ -50,6 +60,10 @@ Installation:
   ln -s $(pwd)/mcp_readonly_fs.py ~/.local/bin/mcp-serve
   # ensure ~/.local/bin is in $PATH (add to ~/.bashrc if not):
   #   export PATH="$HOME/.local/bin:$PATH"
+
+Notes:
+  - With --public-host, uvicorn binds to 127.0.0.1 only (not 192.168.56.1).
+  - Without --public-host, behaviour is unchanged from previous versions.
 """
 
 import argparse
@@ -57,6 +71,7 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -396,6 +411,14 @@ if __name__ == "__main__":
     )
     parser.add_argument("--host", default=None, help="Interface to bind")
     parser.add_argument("--port", type=int, default=None, help="Port to listen on")
+    parser.add_argument("--public-host", default=None, metavar="HOSTNAME",
+                        help="Public hostname for Caddy HTTPS reverse proxy")
+    parser.add_argument("--public-port", type=int, default=None, metavar="PORT",
+                        help="Public HTTPS port for Caddy (default: same as --port)")
+    parser.add_argument("--cert", default=None, metavar="PATH",
+                        help="TLS certificate file for Caddy (PEM, required with --public-host)")
+    parser.add_argument("--key", default=None, metavar="PATH",
+                        help="TLS private key file for Caddy (PEM, required with --public-host)")
     cli = parser.parse_args()
 
     # Resolve served root
@@ -415,13 +438,51 @@ if __name__ == "__main__":
 
     config = load_config(SERVED_ROOT)
 
-    # Config < CLI args
-    host = cli.host or config.get("host", "192.168.56.1")
-    port = cli.port or config.get("port", 9000)
+    # With --public-host, uvicorn binds loopback only; Caddy faces the network.
+    # Without it, fall back to the host-only interface as before.
+    if cli.public_host:
+        default_host = "127.0.0.1"
+    else:
+        default_host = "192.168.56.1"
 
+    host = cli.host or config.get("host", default_host)
+    port = cli.port or config.get("port", 9000)
+    public_port = cli.public_port or port
     log.info("Serving:    %s", SERVED_ROOT)
     log.info("Listening:  %s:%d", host, port)
     log.info("Tools:      %s", ", ".join(TOOLS))
     log.info("Transports: POST /mcp  |  GET /sse + POST /messages")
 
-    uvicorn.run(app, host=host, port=port)
+    caddy_proc = None
+    if cli.public_host:
+        missing = [flag for flag, val in [("--cert", cli.cert), ("--key", cli.key)] if not val]
+        if missing:
+            log.error("--public-host requires %s", " and ".join(missing))
+            sys.exit(1)
+        caddyfile = (
+            f"{cli.public_host}:{public_port} {{\n"
+            f"    bind 192.168.56.1\n"
+            f"    tls {cli.cert} {cli.key}\n"
+            f"    reverse_proxy 127.0.0.1:{port}\n"
+            f"}}\n"
+        )
+        log.info("Starting Caddy: %s:%d -> 127.0.0.1:%d", cli.public_host, public_port, port)
+        log.debug("Caddyfile:\n%s", caddyfile)
+        caddy_proc = subprocess.Popen(
+            ["caddy", "run", "--config", "-", "--adapter", "caddyfile"],
+            stdin=subprocess.PIPE,
+        )
+        caddy_proc.stdin.write(caddyfile.encode())
+        caddy_proc.stdin.close()
+
+    try:
+        uvicorn.run(app, host=host, port=port)
+    finally:
+        if caddy_proc is not None:
+            log.info("Stopping Caddy (pid=%d)", caddy_proc.pid)
+            caddy_proc.terminate()
+            try:
+                caddy_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                log.warning("Caddy did not exit cleanly; killing")
+                caddy_proc.kill()
