@@ -26,4 +26,4 @@ vagrant ssh -- -X claude-desktop
 
 After a surprisingly hard fight, the vagrant machine is running, and displaying via X.  A little more work is required to get the MCP connector working.
 
-This started out as a sub-project of what I actually wanted to be working on, but has reached a point where it clearly deserves its own repository.  I'll make changes to the interface to reflect that - currently it still expects that it's in a sub-directory of the project being worked on.
+
