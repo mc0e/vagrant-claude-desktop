@@ -438,14 +438,7 @@ if __name__ == "__main__":
 
     config = load_config(SERVED_ROOT)
 
-    # With --public-host, uvicorn binds loopback only; Caddy faces the network.
-    # Without it, fall back to the host-only interface as before.
-    if cli.public_host:
-        default_host = "127.0.0.1"
-    else:
-        default_host = "192.168.56.1"
-
-    host = cli.host or config.get("host", default_host)
+    host = cli.host or config.get("host", "127.0.0.1")
     port = cli.port or config.get("port", 9000)
     public_port = cli.public_port or port
     log.info("Serving:    %s", SERVED_ROOT)
