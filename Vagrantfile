@@ -78,10 +78,29 @@ fi
       libatk-bridge2.0-0 libcups2 libcairo2 libgtk-3-0 \
       libpango-1.0-0 libxcomposite1 libxdamage1 libxfixes3 \
       libxrandr2 libgbm1 libxkbcommon0 libasound2 libatspi2.0-0 \
-      libx11-xcb1
+      libx11-xcb1 libgl1-mesa-glx
 
+    # -----------------------------------------------------------------------
+    # Install Node
+    # Debian's version is too old.
+    # -----------------------------------------------------------------------
+    curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+
+    apt install -y nodejs
+
+    node_major=$(node --version | sed 's/v\([0-9]*\).*/\1/')
+    if [ "$node_major" -lt 20 ]; then
+      echo "ERROR: Node.js version $(node --version) is too old, need 20+" >&2
+      exit 1
+    fi
+
+    echo "Node.js $(node --version) installed successfully"
+
+
+    # -----------------------------------------------------------------------
     # Add the claude-desktop-debian apt repository
     #   based on https://github.com/aaddrick/claude-desktop-debian
+    # -----------------------------------------------------------------------
     curl -fsSL https://pkg.claude-desktop-debian.dev/KEY.gpg \
         | gpg --dearmor \
         | tee /usr/share/keyrings/claude-desktop.gpg > /dev/null
@@ -144,8 +163,8 @@ except (FileNotFoundError, json.JSONDecodeError):
     cfg = {}
 cfg["mcpServers"] = {
     "project-filesystem": {
-        "type": "sse",
-        "url": "https://vhost.x.mc0e.net:9000/sse"
+        "command": "npx",
+        "args": ["mcp-remote", "https://vhost.x.mc0e.net:9000/mcp"]
     }
 }
 json.dump(cfg, open(path, "w"), indent=2)
