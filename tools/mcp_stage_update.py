@@ -7,7 +7,7 @@ Exposes three tools to MCP clients:
   - write_file(path, content)     -- stage a file in the current changeset
   - end_changeset()               -- finalise and log the changeset summary
 
-All staged files are written under ~/.claude-staging/<repo-name>/.
+All staged files are written under ~/.claude-staging/<repo-name>/proposed/.
 Nothing can be written outside that directory.
 
 Transports
@@ -69,6 +69,8 @@ MANIFEST_FILENAME = ".manifest.json"
 # Set in main() before the app starts
 SERVED_ROOT: Path
 STAGING_ROOT: Path
+PROPOSED_ROOT: Path
+CURRENT_ROOT: Path
 
 # ---------------------------------------------------------------------------
 # Root discovery
@@ -105,12 +107,12 @@ def load_config(git_root: Path) -> dict:
 
 def safe_stage_resolve(raw: str) -> Path:
     """
-    Resolve a client-supplied path to an absolute path inside STAGING_ROOT.
-    Raises ValueError if the path escapes the staging root.
+    Resolve a client-supplied path to an absolute path inside PROPOSED_ROOT.
+    Raises ValueError if the path escapes the proposed root.
     """
     stripped = raw.lstrip("/")
-    resolved = (STAGING_ROOT / stripped).resolve()
-    if not resolved.is_relative_to(STAGING_ROOT):
+    resolved = (PROPOSED_ROOT / stripped).resolve()
+    if not resolved.is_relative_to(PROPOSED_ROOT):
         raise ValueError(f"Path {raw!r} is outside the allowed staging root")
     if resolved.name == MANIFEST_FILENAME:
         raise ValueError(f"Path {raw!r} is reserved for internal use")
@@ -144,10 +146,11 @@ def tool_begin_changeset(args: dict) -> dict:
     if not description:
         return {"content": [{"type": "text", "text": "description is required"}], "isError": True}
 
-    # Wipe staging
-    if STAGING_ROOT.exists():
-        shutil.rmtree(STAGING_ROOT)
-    STAGING_ROOT.mkdir(parents=True)
+    # Wipe proposed and current subdirs, leave manifest at staging root
+    for subdir in (PROPOSED_ROOT, CURRENT_ROOT):
+        if subdir.exists():
+            shutil.rmtree(subdir)
+    PROPOSED_ROOT.mkdir(parents=True)
 
     manifest = {
         "status": "open",
@@ -253,7 +256,8 @@ TOOLS = {
         "meta": {
             "name": "begin_changeset",
             "description": (
-                "Start a new changeset. Wipes any previously staged files. "
+                "Start a new changeset. Wipes any previously staged files "
+                "and any in-progress merge working directory. "
                 "Must be called before write_file."
             ),
             "inputSchema": {
@@ -491,6 +495,8 @@ if __name__ == "__main__":
             SERVED_ROOT = cwd.resolve()
 
     STAGING_ROOT = Path.home() / ".claude-staging" / SERVED_ROOT.name
+    PROPOSED_ROOT = STAGING_ROOT / "proposed"
+    CURRENT_ROOT  = STAGING_ROOT / "current"
 
     config = load_config(SERVED_ROOT)
     host = cli.host or config.get("stage_host", "127.0.0.1")
@@ -498,6 +504,8 @@ if __name__ == "__main__":
 
     log.info("Repo root:    %s", SERVED_ROOT)
     log.info("Staging root: %s", STAGING_ROOT)
+    log.info("Proposed:     %s", PROPOSED_ROOT)
+    log.info("Current:      %s", CURRENT_ROOT)
     log.info("Listening:    %s:%d", host, port)
     log.info("Tools:        %s", ", ".join(TOOLS))
     log.info("Transports:   POST /mcp  |  GET /sse + POST /messages")
