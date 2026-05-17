@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage:
+  project-patch
+
+Reads a unified diff from stdin, applies it to a temporary
+copy of the current git repository, and launches Meld to
+review the changes.
+
+Workflow:
+  1. Run project-patch
+  2. Paste unified diff into stdin
+  3. Press Ctrl-D
+  4. Review changes in Meld
+  5. Optionally apply and commit
+
+Options:
+  -h, --help    Show this help text
+
+Requirements:
+  - git
+  - meld
+  - patch
+
+Typical usage:
+  project-patch < change.diff
+
+Or interactively:
+  project-patch
+  [paste diff]
+  Ctrl-D
+EOF
+}
+
+if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
+    usage
+    exit 0
+fi
+
+if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
+    echo "Error: not inside a git repository"
+    exit 1
+fi
+
+REPO_ROOT=$(git rev-parse --show-toplevel)
+cd "$REPO_ROOT"
+
+TMPDIR=$(mktemp -d)
+PATCHFILE="$TMPDIR/change.patch"
+PATCHED_TREE="$TMPDIR/patched"
+
+cleanup() {
+    rm -rf "$TMPDIR"
+}
+trap cleanup EXIT
+
+cat > "$PATCHFILE"
+
+if [[ ! -s "$PATCHFILE" ]]; then
+    echo "No patch supplied"
+    exit 1
+fi
+
+mkdir -p "$PATCHED_TREE"
+
+# Copy all files touched by the patch into the temp tree
+grep '^+++ b/' "$PATCHFILE" \
+    | sed 's|^+++ b/||' \
+        | sort -u \
+        | while read -r FILE; do
+        mkdir -p "$PATCHED_TREE/$(dirname "$FILE")"
+        if [[ -f "$REPO_ROOT/$FILE" ]]; then
+                mkdir -p "$PATCHED_TREE/$(dirname "$FILE")"
+            cp -a "$REPO_ROOT/$FILE" "$PATCHED_TREE/$FILE"
+            fi
+        done
+
+# Apply the patch to the temp tree using standard patch tool
+(
+    cd "$PATCHED_TREE"
+    patch -p1 < "$PATCHFILE"
+)
+
+echo
+
+echo "Launching Meld..."
+
+if ! meld "$REPO_ROOT" "$PATCHED_TREE"; then
+    STATUS=$?
+    echo
+    echo "Meld exited with error status $STATUS"
+    echo "Aborting without applying patch"
+    exit $STATUS
+fi
+
+echo
+
+read -rp "Create git commit now? [y/N] " DOCOMMIT
+
+if [[ ! "$DOCOMMIT" =~ ^[Yy]$ ]]; then
+    echo "Patch not committed"
+    exit 0
+fi
+
+ADR_FILE=$(grep -oE '^diff --git a/Design/decisions/[^ ]+' "$PATCHFILE" \
+    | head -n1 \
+    | sed 's#diff --git a/##')
+
+COMMIT_MSG=""
+
+if [[ -n "$ADR_FILE" && -f "$ADR_FILE" ]]; then
+    TITLE=$(grep '^# ' "$ADR_FILE" | head -n1 | sed 's/^# //')
+
+    if [[ -n "$TITLE" ]]; then
+        COMMIT_MSG="$TITLE"
+    fi
+fi
+
+if [[ -z "$COMMIT_MSG" ]]; then
+    read -rp "Commit message: " COMMIT_MSG
+fi
+
+if [[ -z "$COMMIT_MSG" ]]; then
+    echo "Empty commit message; aborting commit"
+    exit 1
+fi
+
+git status --short
+
+echo
+read -rp "Proceed with commit? [y/N] " REALLY
+
+if [[ ! "$REALLY" =~ ^[Yy]$ ]]; then
+    echo "Commit cancelled"
+    exit 0
+fi
+
+git add -A
+git commit -m "$COMMIT_MSG"
+
+echo
+
+echo "Done"

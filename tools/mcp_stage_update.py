@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Read-only MCP filesystem server.
+MCP staging server for AI-proposed file changesets.
 
-Exposes two tools to MCP clients:
-  - list_directory(path)  -- list files and subdirectories under a path
-  - read_file(path)       -- return the contents of a file
+Exposes three tools to MCP clients:
+  - begin_changeset(description)  -- wipe staging, start a new changeset
+  - write_file(path, content)     -- stage a file in the current changeset
+  - end_changeset()               -- finalise and log the changeset summary
 
-All paths are resolved relative to the served root and must remain within it.
-No write operations are exposed.
+All staged files are written under ~/.claude-staging/<repo-name>/.
+Nothing can be written outside that directory.
 
 Transports
 ----------
@@ -19,7 +20,7 @@ Transports
 
 Root discovery (in priority order)
 -----------------------------------
-  1. Positional argument: mcp_readonly_fs.py /path/to/root
+  1. Positional argument: mcp_stage_update.py /path/to/root
   2. Walk up from cwd to find the nearest .git directory
   3. Fall back to cwd if no .git found
 
@@ -27,52 +28,28 @@ Configuration
 -------------
   An optional .mcp-serve.json file at the served root can override defaults:
     {
-      "host": "192.168.56.1",   // default: 192.168.56.1
-      "port": 9000              // default: 9000
+      "stage_host": "127.0.0.1",   // default: 127.0.0.1
+      "stage_port": 9001           // default: 9001
     }
   CLI arguments always override .mcp-serve.json values.
 
 Dependencies:
-  Only starlette + uvicorn — both available as Debian bookworm packages,
-  no extra pip installs required:
-    sudo apt install python3-uvicorn python3-starlette   # Debian bookworm
-    pip install --user starlette uvicorn                 # or via pip
+  Only starlette + uvicorn — both available as Debian bookworm packages:
+    sudo apt install python3-uvicorn python3-starlette
+    pip install --user starlette uvicorn
 
 Usage:
-  mcp_readonly_fs.py [root_path] [--host HOST] [--port PORT]
-
-  To expose via HTTPS, pass --public-host and certificate paths.  Caddy will
-  be started as a reverse proxy and torn down when the server exits:
-    mcp_readonly_fs.py \
-        --public-host vhost.x.mc0e.net \
-        --public-port 9000 \
-        --cert /etc/letsencrypt/live/vhost.x.mc0e.net/fullchain.pem \
-        --key  /etc/letsencrypt/live/vhost.x.mc0e.net/privkey.pem
-  Caddy listens on 192.168.56.1:<public-port> (HTTPS) and forwards to
-  127.0.0.1:<port> (HTTP).  Requires caddy >= 2.0 in $PATH.
-
-  For use from a Vagrant VM, bind to the host-only interface:
-    mcp_readonly_fs.py --host 192.168.56.1
-  or set "host" in .mcp-serve.json at the repo root.
-
-Installation:
-  chmod +x mcp_readonly_fs.py
-  ln -s $(pwd)/mcp_readonly_fs.py ~/.local/bin/mcp-serve
-  # ensure ~/.local/bin is in $PATH (add to ~/.bashrc if not):
-  #   export PATH="$HOME/.local/bin:$PATH"
-
-Notes:
-  - With --public-host, uvicorn binds to 127.0.0.1 only (not 192.168.56.1).
-  - Without --public-host, behaviour is unchanged from previous versions.
+  mcp_stage_update.py [root_path] [--host HOST] [--port PORT]
 """
 
 import argparse
 import asyncio
 import json
 import logging
-import os
+import shutil
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import uvicorn
@@ -84,18 +61,21 @@ from starlette.routing import Route
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-SERVER_INFO = {"name": "mcp-readonly-fs", "version": "0.3.0"}
+SERVER_INFO = {"name": "mcp-stage-update", "version": "0.1.0"}
 PROTOCOL_VERSION = "2024-11-05"
+
+MANIFEST_FILENAME = ".manifest.json"
 
 # Set in main() before the app starts
 SERVED_ROOT: Path
+STAGING_ROOT: Path
 
 # ---------------------------------------------------------------------------
 # Root discovery
 # ---------------------------------------------------------------------------
 
 def find_git_root(start: Path) -> Path | None:
-    """Walk up from start until a .git directory is found. Returns None if not found."""
+    """Walk up from start until a .git directory is found."""
     current = start.resolve()
     while True:
         if (current / ".git").exists():
@@ -123,117 +103,211 @@ def load_config(git_root: Path) -> dict:
 # Path safety
 # ---------------------------------------------------------------------------
 
-def safe_resolve(raw: str) -> Path:
+def safe_stage_resolve(raw: str) -> Path:
     """
-    Resolve a client-supplied path to an absolute path inside SERVED_ROOT.
-    Raises ValueError if the path escapes the root.
+    Resolve a client-supplied path to an absolute path inside STAGING_ROOT.
+    Raises ValueError if the path escapes the staging root.
     """
     stripped = raw.lstrip("/")
-    resolved = (SERVED_ROOT / stripped).resolve()
-    if not resolved.is_relative_to(SERVED_ROOT):
-        raise ValueError(f"Path {raw!r} is outside the allowed root")
+    resolved = (STAGING_ROOT / stripped).resolve()
+    if not resolved.is_relative_to(STAGING_ROOT):
+        raise ValueError(f"Path {raw!r} is outside the allowed staging root")
+    if resolved.name == MANIFEST_FILENAME:
+        raise ValueError(f"Path {raw!r} is reserved for internal use")
     return resolved
+
+# ---------------------------------------------------------------------------
+# Manifest helpers
+# ---------------------------------------------------------------------------
+
+def read_manifest() -> dict:
+    manifest_path = STAGING_ROOT / MANIFEST_FILENAME
+    if not manifest_path.exists():
+        return {}
+    try:
+        return json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def write_manifest(manifest: dict) -> None:
+    manifest_path = STAGING_ROOT / MANIFEST_FILENAME
+    STAGING_ROOT.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
 # ---------------------------------------------------------------------------
 # Tool implementations
 # ---------------------------------------------------------------------------
 
-def tool_list_directory(args: dict) -> dict:
-    raw = args.get("path", "")
+def tool_begin_changeset(args: dict) -> dict:
+    description = args.get("description", "").strip()
+    if not description:
+        return {"content": [{"type": "text", "text": "description is required"}], "isError": True}
+
+    # Wipe staging
+    if STAGING_ROOT.exists():
+        shutil.rmtree(STAGING_ROOT)
+    STAGING_ROOT.mkdir(parents=True)
+
+    manifest = {
+        "status": "open",
+        "description": description,
+        "started": datetime.now(timezone.utc).isoformat(),
+        "repo": str(SERVED_ROOT),
+        "files": [],
+    }
+    write_manifest(manifest)
+
+    log.info("Changeset begun: %s", description)
+    return {
+        "content": [{"type": "text", "text": f"Changeset started: {description}"}],
+        "isError": False,
+    }
+
+
+def tool_write_file(args: dict) -> dict:
+    raw = args.get("path", "").strip()
+    content = args.get("content")
+
+    if not raw:
+        return {"content": [{"type": "text", "text": "path is required"}], "isError": True}
+    if content is None:
+        return {"content": [{"type": "text", "text": "content is required"}], "isError": True}
+
+    manifest = read_manifest()
+    if not manifest:
+        return {
+            "content": [{"type": "text", "text": "No active changeset. Call begin_changeset first."}],
+            "isError": True,
+        }
+    if manifest.get("status") != "open":
+        return {
+            "content": [{"type": "text", "text": f"Changeset is not open (status: {manifest.get('status')!r}). Call begin_changeset to start a new one."}],
+            "isError": True,
+        }
+
     try:
-        target = safe_resolve(raw)
+        target = safe_stage_resolve(raw)
     except ValueError as e:
         return {"content": [{"type": "text", "text": str(e)}], "isError": True}
 
-    if not target.exists():
-        return {"content": [{"type": "text", "text": f"Path does not exist: {raw}"}], "isError": True}
-    if not target.is_dir():
-        return {"content": [{"type": "text", "text": f"Not a directory: {raw}"}], "isError": True}
+    # Refuse overwrite
+    if target.exists():
+        return {
+            "content": [{"type": "text", "text": f"File already staged: {raw}. Overwrite not permitted within a changeset."}],
+            "isError": True,
+        }
 
-    entries = []
-    for entry in sorted(target.iterdir()):
-        rel = entry.relative_to(SERVED_ROOT)
-        kind = "dir" if entry.is_dir() else "file"
-        size = "" if entry.is_dir() else f"  ({entry.stat().st_size} bytes)"
-        entries.append(f"{kind}  {rel}{size}")
-
-    text = "\n".join(entries) if entries else "(empty directory)"
-    return {"content": [{"type": "text", "text": text}], "isError": False}
-
-
-def tool_read_file(args: dict) -> dict:
-    raw = args.get("path", "")
-    try:
-        target = safe_resolve(raw)
-    except ValueError as e:
-        return {"content": [{"type": "text", "text": str(e)}], "isError": True}
-
-    if not target.exists():
-        return {"content": [{"type": "text", "text": f"File does not exist: {raw}"}], "isError": True}
-    if not target.is_file():
-        return {"content": [{"type": "text", "text": f"Not a file: {raw}"}], "isError": True}
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content, encoding="utf-8")
 
     size = target.stat().st_size
-    if size > 1_000_000:
+    manifest["files"].append({"path": raw, "size": size})
+    write_manifest(manifest)
+
+    log.info("Staged: %s (%d bytes)", raw, size)
+    return {
+        "content": [{"type": "text", "text": f"Staged: {raw} ({size} bytes)"}],
+        "isError": False,
+    }
+
+
+def tool_end_changeset(args: dict) -> dict:
+    manifest = read_manifest()
+    if not manifest:
         return {
-            "content": [{"type": "text", "text": f"File too large ({size} bytes). Max 1 MB."}],
+            "content": [{"type": "text", "text": "No active changeset."}],
+            "isError": True,
+        }
+    if manifest.get("status") != "open":
+        return {
+            "content": [{"type": "text", "text": f"Changeset is not open (status: {manifest.get('status')!r})."}],
             "isError": True,
         }
 
-    try:
-        text = target.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        return {
-            "content": [{"type": "text", "text": f"File is not valid UTF-8: {raw}"}],
-            "isError": True,
-        }
+    manifest["status"] = "complete"
+    manifest["completed"] = datetime.now(timezone.utc).isoformat()
+    write_manifest(manifest)
 
-    return {"content": [{"type": "text", "text": text}], "isError": False}
+    files = manifest.get("files", [])
+    total = sum(f["size"] for f in files)
+    lines = [
+        f"Changeset complete: {manifest['description']}",
+        f"{len(files)} file(s), {total} bytes total:",
+    ] + [f"  {f['path']} ({f['size']} bytes)" for f in files]
+
+    summary = "\n".join(lines)
+    log.info("%s", summary)
+
+    return {
+        "content": [{"type": "text", "text": summary}],
+        "isError": False,
+    }
 
 # ---------------------------------------------------------------------------
 # Tool registry
 # ---------------------------------------------------------------------------
 
 TOOLS = {
-    "list_directory": {
+    "begin_changeset": {
         "meta": {
-            "name": "list_directory",
+            "name": "begin_changeset",
             "description": (
-                "List the contents of a directory within the served root. "
-                "Pass an empty string or '.' for the root."
+                "Start a new changeset. Wipes any previously staged files. "
+                "Must be called before write_file."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "description": {
+                        "type": "string",
+                        "description": "Brief description of this changeset (used as git commit message suggestion)",
+                    }
+                },
+                "required": ["description"],
+            },
+        },
+        "fn": tool_begin_changeset,
+    },
+    "write_file": {
+        "meta": {
+            "name": "write_file",
+            "description": (
+                "Stage a file in the current changeset. "
+                "Path is relative to the repo root. "
+                "Refuses to overwrite a file already staged in this changeset."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative path within the root (e.g. 'src' or 'src/lib')",
-                    }
+                        "description": "Relative path within the repo root (e.g. 'scripts/foo' or 'Design/Architecture.md')",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Full UTF-8 text content of the file",
+                    },
                 },
+                "required": ["path", "content"],
+            },
+        },
+        "fn": tool_write_file,
+    },
+    "end_changeset": {
+        "meta": {
+            "name": "end_changeset",
+            "description": (
+                "Finalise the current changeset. Logs a summary of staged files. "
+                "The changeset is then ready for review with project-merge-update."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
                 "required": [],
             },
         },
-        "fn": tool_list_directory,
-    },
-    "read_file": {
-        "meta": {
-            "name": "read_file",
-            "description": (
-                "Read the contents of a file within the served root. "
-                "Returns the raw text content."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Relative path to the file within the root (e.g. 'README.md')",
-                    }
-                },
-                "required": ["path"],
-            },
-        },
-        "fn": tool_read_file,
+        "fn": tool_end_changeset,
     },
 }
 
@@ -250,10 +324,6 @@ def jsonrpc_error(id_, code, message):
 
 
 def dispatch(msg: dict) -> dict | None:
-    """
-    Handle one JSON-RPC message. Returns a dict to send back, or None for
-    notifications (which must not receive a response).
-    """
     id_ = msg.get("id")
     method = msg.get("method", "")
     params = msg.get("params") or {}
@@ -310,13 +380,6 @@ async def mcp_endpoint(request: Request) -> Response:
 
 # ---------------------------------------------------------------------------
 # SSE transport  GET /sse  +  POST /messages
-#
-# Implemented with raw Starlette StreamingResponse — no sse-starlette needed.
-#
-# Protocol:
-#   1. Client opens GET /sse → receives event: endpoint pointing to /messages
-#   2. Client POSTs JSON-RPC to /messages?session_id=...
-#   3. Server pushes JSON-RPC response over the open SSE stream
 # ---------------------------------------------------------------------------
 
 _sse_queues: dict[str, asyncio.Queue] = {}
@@ -394,7 +457,7 @@ app = Starlette(routes=[
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Read-only MCP filesystem server",
+        description="MCP staging server for AI-proposed file changesets",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Root discovery: walks up from cwd to find the nearest .git directory;\n"
@@ -407,21 +470,12 @@ if __name__ == "__main__":
         "root_path",
         nargs="?",
         default=None,
-        help="Directory to serve (default: nearest git root above cwd, or cwd)",
+        help="Repo root to serve (default: nearest git root above cwd, or cwd)",
     )
     parser.add_argument("--host", default=None, help="Interface to bind")
     parser.add_argument("--port", type=int, default=None, help="Port to listen on")
-    parser.add_argument("--public-host", default=None, metavar="HOSTNAME",
-                        help="Public hostname for Caddy HTTPS reverse proxy")
-    parser.add_argument("--public-port", type=int, default=None, metavar="PORT",
-                        help="Public HTTPS port for Caddy (default: same as --port)")
-    parser.add_argument("--cert", default=None, metavar="PATH",
-                        help="TLS certificate file for Caddy (PEM, required with --public-host)")
-    parser.add_argument("--key", default=None, metavar="PATH",
-                        help="TLS private key file for Caddy (PEM, required with --public-host)")
     cli = parser.parse_args()
 
-    # Resolve served root
     if cli.root_path:
         SERVED_ROOT = Path(cli.root_path).resolve()
         if not SERVED_ROOT.is_dir():
@@ -436,46 +490,16 @@ if __name__ == "__main__":
             log.warning("No .git directory found above %s; serving cwd", cwd)
             SERVED_ROOT = cwd.resolve()
 
+    STAGING_ROOT = Path.home() / ".claude-staging" / SERVED_ROOT.name
+
     config = load_config(SERVED_ROOT)
+    host = cli.host or config.get("stage_host", "127.0.0.1")
+    port = cli.port or config.get("stage_port", 9001)
 
-    host = cli.host or config.get("host", "127.0.0.1")
-    port = cli.port or config.get("port", 9000)
-    public_port = cli.public_port or port
-    log.info("Serving:    %s", SERVED_ROOT)
-    log.info("Listening:  %s:%d", host, port)
-    log.info("Tools:      %s", ", ".join(TOOLS))
-    log.info("Transports: POST /mcp  |  GET /sse + POST /messages")
+    log.info("Repo root:    %s", SERVED_ROOT)
+    log.info("Staging root: %s", STAGING_ROOT)
+    log.info("Listening:    %s:%d", host, port)
+    log.info("Tools:        %s", ", ".join(TOOLS))
+    log.info("Transports:   POST /mcp  |  GET /sse + POST /messages")
 
-    caddy_proc = None
-    if cli.public_host:
-        missing = [flag for flag, val in [("--cert", cli.cert), ("--key", cli.key)] if not val]
-        if missing:
-            log.error("--public-host requires %s", " and ".join(missing))
-            sys.exit(1)
-        caddyfile = (
-            f"{cli.public_host}:{public_port} {{\n"
-            f"    bind 192.168.56.1\n"
-            f"    tls {cli.cert} {cli.key}\n"
-            f"    reverse_proxy 127.0.0.1:{port}\n"
-            f"}}\n"
-        )
-        log.info("Starting Caddy: %s:%d -> 127.0.0.1:%d", cli.public_host, public_port, port)
-        log.debug("Caddyfile:\n%s", caddyfile)
-        caddy_proc = subprocess.Popen(
-            ["caddy", "run", "--config", "-", "--adapter", "caddyfile"],
-            stdin=subprocess.PIPE,
-        )
-        caddy_proc.stdin.write(caddyfile.encode())
-        caddy_proc.stdin.close()
-
-    try:
-        uvicorn.run(app, host=host, port=port)
-    finally:
-        if caddy_proc is not None:
-            log.info("Stopping Caddy (pid=%d)", caddy_proc.pid)
-            caddy_proc.terminate()
-            try:
-                caddy_proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                log.warning("Caddy did not exit cleanly; killing")
-                caddy_proc.kill()
+    uvicorn.run(app, host=host, port=port)
