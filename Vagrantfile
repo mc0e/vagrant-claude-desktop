@@ -154,6 +154,7 @@ fi
 
 
 # Update only the mcpServers section, preserving any other config
+# npx connections cannot be configured inside the GUI
     python3 - "$CLAUDE_CFG_DIR/claude_desktop_config.json" <<'EOF'
 import json, sys
 path = sys.argv[1]
@@ -165,6 +166,10 @@ cfg["mcpServers"] = {
     "project-filesystem": {
         "command": "npx",
         "args": ["mcp-remote", "https://vhost.x.mc0e.net:9000/mcp"]
+    },
+    "merge-update": {
+        "command": "npx",
+        "args": ["mcp-remote", "https://vhost.x.mc0e.net:9001/mcp"]
     }
 }
 json.dump(cfg, open(path, "w"), indent=2)
