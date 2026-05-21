@@ -4,6 +4,11 @@ This file documents the MCP tools and scripts available for AI-assisted
 development in this project. Reference it at the start of sessions where
 you will be proposing file changes.
 
+## PATH export
+
+The user should have added the tools directory to their PATH.  This will typically 
+be done using direnv and a .envrc file in the project directory.
+
 ## MCP Servers
 
 Two MCP servers run on the host machine alongside Claude Desktop:
@@ -52,10 +57,10 @@ be written outside this directory.
 
 ## Reviewing and Merging Changes
 
-Run `scripts/project-merge-update` from anywhere inside the repo:
+Run `project-merge-update` from anywhere inside the repo:
 
 ```bash
-scripts/project-merge-update
+project-merge-update
 ```
 
 This will:
@@ -77,6 +82,4 @@ before proposing changes to it, to avoid working from stale content.
 
 | Script | Purpose |
 |--------|---------|
-| `scripts/project-merge-update` | Review and merge a staged changeset |
-| `scripts/project-zip-patch` | Legacy: review and merge a zip file of changes |
-| `scripts/project-patch` | Legacy: review and apply a unified diff |
+| `project-merge-update` | Review and merge a staged changeset |
