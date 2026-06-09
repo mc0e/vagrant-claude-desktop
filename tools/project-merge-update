@@ -16,15 +16,18 @@ Directory layout:
   ~/.claude-staging/<repo-name>/
     .manifest.json
     proposed/    new file versions written by the MCP server
-    current/     copy of project files for Meld comparison (persistent)
+    current/     copy of project files for Meld comparison (populated on
+                 first run, then updated from itself after each merge)
 
 Workflow:
   1. Run project-merge-update
   2. Review and selectively merge changes in Meld
      (left = current project files, right = proposed changes)
   3. Close Meld
-  4. Optionally copy proposed files into project and commit
-  5. Re-run to resume an in-progress merge session
+  4. Optionally copy merged files from current/ into the project and commit
+  5. Re-run to resume an in-progress merge session — current/ reflects
+     whatever was last copied into the project, so Meld always shows
+     the true baseline on the left
 
 Options:
   -h, --help    Show this help text
@@ -136,26 +139,27 @@ if ! meld "$CURRENT_ROOT" "$PROPOSED_ROOT"; then
 fi
 
 echo
-read -rp "Copy all proposed files into project? [y/N] " DOCOPY
+read -rp "Copy merged files from current/ into project? [y/N] " DOCOPY
 
 if [[ ! "$DOCOPY" =~ ^[Yy]$ ]]; then
     echo "No files copied. Run again to reopen Meld."
     exit 0
 fi
 
-# Copy proposed files into the project tree, skipping empty files
+# Copy from current/ into the project tree, skipping empty files.
+# Empty files in current/ mean the change was not adopted in Meld.
 python3 -c "
 import json, sys
 m = json.load(open('$MANIFEST'))
 for f in m.get('files', []):
     print(f['path'])
 " | while read -r FILE; do
-    if [[ ! -s "$PROPOSED_ROOT/$FILE" ]]; then
+    if [[ ! -s "$CURRENT_ROOT/$FILE" ]]; then
         echo "  skipped (empty): $FILE"
         continue
     fi
     mkdir -p "$REPO_ROOT/$(dirname "$FILE")"
-    cp -a "$PROPOSED_ROOT/$FILE" "$REPO_ROOT/$FILE"
+    cp -a "$CURRENT_ROOT/$FILE" "$REPO_ROOT/$FILE"
     echo "  copied: $FILE"
 done
 

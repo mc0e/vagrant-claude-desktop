@@ -2,10 +2,14 @@
 """
 MCP staging server for AI-proposed file changesets.
 
-Exposes three tools to MCP clients:
-  - begin_changeset(description)  -- wipe staging, start a new changeset
-  - write_file(path, content)     -- stage a file in the current changeset
-  - end_changeset()               -- finalise and log the changeset summary
+Exposes four tools to MCP clients:
+  - begin_changeset(description)              -- wipe staging, start a new changeset
+  - write_file(path, content)                 -- stage a whole file in the current changeset
+  - str_replace(path, old_str, new_str, description?)
+                                              -- copy original from project, apply a string
+                                                 replacement; may be called repeatedly on the
+                                                 same path to build up a set of edits
+  - end_changeset()                           -- finalise and log the changeset summary
 
 All staged files are written under ~/.claude-staging/<repo-name>/proposed/.
 Nothing can be written outside that directory.
@@ -61,7 +65,7 @@ from starlette.routing import Route
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-SERVER_INFO = {"name": "mcp-stage-update", "version": "0.1.0"}
+SERVER_INFO = {"name": "mcp-stage-update", "version": "0.2.0"}
 PROTOCOL_VERSION = "2024-11-05"
 
 MANIFEST_FILENAME = ".manifest.json"
@@ -137,6 +141,14 @@ def write_manifest(manifest: dict) -> None:
     STAGING_ROOT.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
+
+def manifest_file_entry(manifest: dict, path: str) -> dict | None:
+    """Return the manifest entry for the given path, or None."""
+    for f in manifest.get("files", []):
+        if f["path"] == path:
+            return f
+    return None
+
 # ---------------------------------------------------------------------------
 # Tool implementations
 # ---------------------------------------------------------------------------
@@ -194,8 +206,14 @@ def tool_write_file(args: dict) -> dict:
     except ValueError as e:
         return {"content": [{"type": "text", "text": str(e)}], "isError": True}
 
-    # Refuse overwrite
-    if target.exists():
+    # Check for existing entry
+    entry = manifest_file_entry(manifest, raw)
+    if entry is not None:
+        if entry.get("method") == "str_replace":
+            return {
+                "content": [{"type": "text", "text": f"File already staged via str_replace: {raw}. Cannot mix write_file and str_replace on the same path."}],
+                "isError": True,
+            }
         return {
             "content": [{"type": "text", "text": f"File already staged: {raw}. Overwrite not permitted within a changeset."}],
             "isError": True,
@@ -205,12 +223,97 @@ def tool_write_file(args: dict) -> dict:
     target.write_text(content, encoding="utf-8")
 
     size = target.stat().st_size
-    manifest["files"].append({"path": raw, "size": size})
+    manifest["files"].append({"path": raw, "size": size, "method": "write"})
     write_manifest(manifest)
 
     log.info("Staged: %s (%d bytes)", raw, size)
     return {
         "content": [{"type": "text", "text": f"Staged: {raw} ({size} bytes)"}],
+        "isError": False,
+    }
+
+
+def tool_str_replace(args: dict) -> dict:
+    raw = args.get("path", "").strip()
+    old_str = args.get("old_str")
+    new_str = args.get("new_str", "")
+    description = args.get("description", "").strip()
+
+    if not raw:
+        return {"content": [{"type": "text", "text": "path is required"}], "isError": True}
+    if old_str is None:
+        return {"content": [{"type": "text", "text": "old_str is required"}], "isError": True}
+
+    manifest = read_manifest()
+    if not manifest:
+        return {
+            "content": [{"type": "text", "text": "No active changeset. Call begin_changeset first."}],
+            "isError": True,
+        }
+    if manifest.get("status") != "open":
+        return {
+            "content": [{"type": "text", "text": f"Changeset is not open (status: {manifest.get('status')!r}). Call begin_changeset to start a new one."}],
+            "isError": True,
+        }
+
+    try:
+        target = safe_stage_resolve(raw)
+    except ValueError as e:
+        return {"content": [{"type": "text", "text": str(e)}], "isError": True}
+
+    # Check for mixing with write_file
+    entry = manifest_file_entry(manifest, raw)
+    if entry is not None and entry.get("method") == "write":
+        return {
+            "content": [{"type": "text", "text": f"File already staged via write_file: {raw}. Cannot mix write_file and str_replace on the same path."}],
+            "isError": True,
+        }
+
+    # If not yet staged, copy the original from the project tree
+    if entry is None:
+        source = SERVED_ROOT / raw.lstrip("/")
+        if not source.exists():
+            return {
+                "content": [{"type": "text", "text": f"File not found in project tree: {raw}"}],
+                "isError": True,
+            }
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        log.info("Copied original for str_replace: %s", raw)
+
+    # Apply the replacement
+    current_content = target.read_text(encoding="utf-8")
+    count = current_content.count(old_str)
+
+    if count == 0:
+        return {
+            "content": [{"type": "text", "text": f"str_replace failed: old_str not found in {raw}"}],
+            "isError": True,
+        }
+
+    new_content = current_content.replace(old_str, new_str)
+    target.write_text(new_content, encoding="utf-8")
+    size = target.stat().st_size
+
+    # Update or insert the manifest entry
+    if entry is None:
+        manifest["files"].append({
+            "path": raw,
+            "size": size,
+            "method": "str_replace",
+            "replacements": 1,
+        })
+    else:
+        entry["size"] = size
+        entry["replacements"] = entry.get("replacements", 0) + 1
+
+    write_manifest(manifest)
+
+    desc_note = f" ({description})" if description else ""
+    msg = f"str_replace applied{desc_note}: {count} match(es) replaced in {raw} ({size} bytes)"
+    log.info("%s", msg)
+    return {
+        "content": [{"type": "text", "text": msg}],
         "isError": False,
     }
 
@@ -237,7 +340,13 @@ def tool_end_changeset(args: dict) -> dict:
     lines = [
         f"Changeset complete: {manifest['description']}",
         f"{len(files)} file(s), {total} bytes total:",
-    ] + [f"  {f['path']} ({f['size']} bytes)" for f in files]
+    ]
+    for f in files:
+        method = f.get("method", "write")
+        if method == "str_replace":
+            lines.append(f"  {f['path']} ({f['size']} bytes, str_replace x{f.get('replacements', '?')})")
+        else:
+            lines.append(f"  {f['path']} ({f['size']} bytes)")
 
     summary = "\n".join(lines)
     log.info("%s", summary)
@@ -258,7 +367,7 @@ TOOLS = {
             "description": (
                 "Start a new changeset. Wipes any previously staged files "
                 "and any in-progress merge working directory. "
-                "Must be called before write_file."
+                "Must be called before write_file or str_replace."
             ),
             "inputSchema": {
                 "type": "object",
@@ -279,7 +388,8 @@ TOOLS = {
             "description": (
                 "Stage a file in the current changeset. "
                 "Path is relative to the repo root. "
-                "Refuses to overwrite a file already staged in this changeset."
+                "Refuses to overwrite a file already staged in this changeset. "
+                "Cannot be used on a path already touched by str_replace."
             ),
             "inputSchema": {
                 "type": "object",
@@ -297,6 +407,43 @@ TOOLS = {
             },
         },
         "fn": tool_write_file,
+    },
+    "str_replace": {
+        "meta": {
+            "name": "str_replace",
+            "description": (
+                "Apply a string replacement to a file from the project tree. "
+                "On the first call for a given path, the original file is copied from the "
+                "project into the staging area; subsequent calls operate on the already-staged "
+                "copy, allowing a series of edits to be built up incrementally. "
+                "Errors if old_str is not found in the file. "
+                "Reports the number of matches replaced on success. "
+                "Cannot be used on a path already staged via write_file."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative path within the repo root (e.g. 'scripts/foo')",
+                    },
+                    "old_str": {
+                        "type": "string",
+                        "description": "Exact string to find in the file. Should be unique enough to identify the target location unambiguously.",
+                    },
+                    "new_str": {
+                        "type": "string",
+                        "description": "Replacement string. Omit or pass empty string to delete old_str.",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Optional brief note on what this edit does (recorded in the manifest).",
+                    },
+                },
+                "required": ["path", "old_str"],
+            },
+        },
+        "fn": tool_str_replace,
     },
     "end_changeset": {
         "meta": {
